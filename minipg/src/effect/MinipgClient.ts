@@ -225,6 +225,9 @@ export const fromPool = Effect.fnUntraced(
 			['server.port', target.port],
 			['driver', 'minipg'],
 		] satisfies ReadonlyArray<readonly [string, unknown]>;
+		// Effect 4.0.6 requires `driver`, and older 4.x versions reject it as an unknown key in an object
+		// literal. A spread is not checked for unknown keys, so this compiles on both.
+		const driverOption = { driver: 'minipg' };
 		const client = yield* Client.make({
 			acquirer,
 			// A transaction always takes its own connection, so it never pulls the pipeline's statements into it.
@@ -235,6 +238,7 @@ export const fromPool = Effect.fnUntraced(
 			releaseSavepoint: (name) => `RELEASE SAVEPOINT ${name}`,
 			spanAttributes,
 			transformRows,
+			...driverOption,
 		});
 
 		const scopedConnection = Effect.flatMap(
@@ -249,7 +253,9 @@ export const fromPool = Effect.fnUntraced(
 			Effect.scoped(Effect.flatMap(scopedConnection, f));
 
 		// A span per operation, named and attributed as Effect names the spans of sql statements.
-		const spanName = Statement.spanName(spanAttributes);
+		// `Statement.spanName` exists from Effect 4.0.1. Effect 4.0.0 names every statement span `sql.execute`.
+		const effectSpanName = (Statement as { spanName?: (attributes: typeof spanAttributes) => string }).spanName;
+		const spanName = effectSpanName ? effectSpanName(spanAttributes) : 'sql.execute';
 		const spanOptions = (operation: string, text: string) => ({
 			kind: 'client' as const,
 			attributes: { ...Object.fromEntries(spanAttributes), 'db.operation.name': operation, 'db.query.text': text },
@@ -376,12 +382,21 @@ export const fromPool = Effect.fnUntraced(
 		const all = <A, E, R>(effects: Iterable<Effect.Effect<A, E, R>>) =>
 			Effect.all(effects, { concurrency: 'unbounded' });
 		const batch = <A, E, R>(effects: Iterable<Effect.Effect<A, E, R>>) => withTransaction(all(effects));
+		// Effect.all interrupts the other statements when one fails, and an interrupt cancels the running one
+		// on the server. Each pipeline statement commits on its own, so all of them run to the end, and the
+		// first failure in statement order is the result.
+		const allSettled = <A, E, R>(effects: Iterable<Effect.Effect<A, E, R>>) =>
+			Effect.flatMap(
+				Effect.all(Array.from(effects, (effect) => Effect.exit(effect)), { concurrency: 'unbounded' }),
+				(exits) => Effect.all(exits),
+			);
 		const pipeline = <A, E, R>(effects: Iterable<Effect.Effect<A, E, R>>) =>
 			Effect.flatMap(Effect.serviceOption(client.transactionService), (tx) =>
 				Option.isSome(tx)
-					? all(effects)
+					? allSettled(effects)
 					: Effect.scoped(
-						Effect.flatMap(poolConnection, (conn) => Effect.provideService(all(effects), pipelineConnection, conn)),
+						Effect.flatMap(poolConnection, (conn) =>
+							Effect.provideService(allSettled(effects), pipelineConnection, conn)),
 					));
 
 		return Object.assign(client, {
